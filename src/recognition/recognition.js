@@ -1,49 +1,49 @@
-import {
-  InferenceEngine,
-  preprocessStrokes,
-  isStrokeMeaningful,
-  loadVocab,
-} from "ink-on/core";
+import { isStrokeMeaningful, preprocessStrokes } from "ink-on/core";
+import { RecognitionClient } from "./recognition-client.js";
 
-let engine = null;
-let vocab = null;
+let client = null;
+let initialization = null;
+let recognitionState = "idle";
+
+function getClient() {
+  if (!client) {
+    client = new RecognitionClient();
+  }
+  return client;
+}
+
+export function getRecognitionState() {
+  return recognitionState;
+}
 
 export async function initializeRecognition() {
-  if (engine) {
+  if (recognitionState === "ready") {
     return;
   }
 
-  console.log("Loading CalcInk recognition model...");
+  if (!initialization) {
+    recognitionState = "loading";
+    initialization = getClient()
+      .initialize()
+      .then(() => {
+        recognitionState = "ready";
+      })
+      .catch((error) => {
+        recognitionState = "error";
+        initialization = null;
+        throw error;
+      });
+  }
 
-  vocab = await loadVocab(
-    "/models/comer/vocab.json"
-  );
-
-  engine = new InferenceEngine({
-    encoderUrl:
-      "/models/comer/encoder_int8.onnx",
-
-    decoderUrl:
-      "/models/comer/decoder_int8.onnx",
-
-    beamWidth: 3,
-
-    executionProvider: "wasm",
-  });
-
-  await engine.init();
-
-  console.log(
-    "CalcInk recognition model loaded."
-  );
+  await initialization;
 }
 
 export async function recognizeStrokes(strokes) {
-  if (!engine || !vocab) {
-    throw new Error(
-      "Recognition engine is not initialized."
-    );
+  if (!strokes || strokes.length === 0) {
+    return null;
   }
+
+  await initializeRecognition();
 
   const modelStrokes = strokes.map((stroke) => ({
     points: stroke.points,
@@ -55,20 +55,24 @@ export async function recognizeStrokes(strokes) {
   }
 
   const input = preprocessStrokes(modelStrokes);
+  const result = await getClient().recognize(input);
+  if (!result) {
+    return null;
+  }
 
-  const result = await engine.recognize(
-    input,
-    vocab,
-    "number"
-  );
-
-  return result;
+  return {
+    latex: result.latex,
+    timing: {
+      encoderMs: result.encoderMs,
+      decoderMs: result.decoderMs,
+      totalMs: result.totalMs,
+    },
+  };
 }
 
 export function disposeRecognition() {
-  if (engine) {
-    engine.dispose();
-    engine = null;
-    vocab = null;
-  }
+  client?.dispose();
+  client = null;
+  initialization = null;
+  recognitionState = "idle";
 }
