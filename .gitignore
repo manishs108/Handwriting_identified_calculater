@@ -147,3 +147,23 @@ vite.config.ts.timestamp-*
 
 # Turbo Repo
 .turbo
+
+# CalcInk local and security files
+logs
+pnpm-debug.log*
+lerna-debug.log*
+dist-ssr
+*.local
+*.pem
+*.key
+
+# Editor and operating-system metadata
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
