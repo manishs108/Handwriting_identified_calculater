@@ -4,7 +4,8 @@ import {
   initializeRecognition,
   recognizeStrokes,
 } from "./recognition/recognition";
-import { evaluateExpression } from "./math/evaluator";
+import { calculateRecognizedExpression } from "./math/calculation-pipeline";
+import { createRevisionController } from "./recognition/revision-controller";
 
 function ToolbarIcon({ name }) {
   const paths = {
@@ -95,7 +96,7 @@ function App() {
   const redoStackRef = useRef([]);
 
   const drawingRef = useRef(false);
-  const recognitionRequestRef = useRef(0);
+  const recognitionRevisionRef = useRef(createRevisionController());
 
   const [brushSize, setBrushSize] = useState(4);
   const [zoom, setZoom] = useState(() => {
@@ -491,6 +492,11 @@ function App() {
       previous || [];
 
     redrawCanvas();
+    recognitionRevisionRef.current.invalidate();
+    setCalculationResult(null);
+    if (strokesRef.current.length > 0) {
+      processRecognition();
+    }
   }
 
   /*
@@ -516,6 +522,11 @@ function App() {
       next || [];
 
     redrawCanvas();
+    recognitionRevisionRef.current.invalidate();
+    setCalculationResult(null);
+    if (strokesRef.current.length > 0) {
+      processRecognition();
+    }
   }
 
   /*
@@ -708,6 +719,8 @@ function App() {
 
     if (tool === "eraser" || tool === "stroke-eraser") {
       saveHistory();
+      recognitionRevisionRef.current.invalidate();
+      setCalculationResult(null);
 
       if (tool === "stroke-eraser") eraseStrokeAtPoint(point);
       else eraseAtPoint(point);
@@ -1048,6 +1061,76 @@ top =
     fontSize,
   };
 }
+  function processRecognition() {
+    const currentStrokes = strokesRef.current;
+    if (!currentStrokes || currentStrokes.length === 0) {
+      recognitionRevisionRef.current.invalidate();
+      setCalculationResult(null);
+      return;
+    }
+
+    const revisionId = recognitionRevisionRef.current.next();
+
+    recognizeStrokes(currentStrokes)
+      .then((result) => {
+        // Ignore an older recognition result if user modified the canvas
+        if (!recognitionRevisionRef.current.isCurrent(revisionId)) {
+          console.log(
+            "⏭️ Ignoring stale recognition result for revision",
+            revisionId
+          );
+          return;
+        }
+
+        console.log("🤖 AI recognition result:", result);
+
+        if (!result) {
+          setCalculationResult(null);
+          return;
+        }
+
+        const calculation = calculateRecognizedExpression(result);
+        console.log("🧮 Calculation result:", calculation);
+
+        if (calculation.status === "ready") {
+          setCalculationResult(calculation.displayResult);
+
+          const position = calculateResultPosition(
+            strokesRef.current,
+            calculation.displayResult
+          );
+          setResultPosition(position);
+
+          setCalculationHistory((history) => [
+            {
+              id: crypto.randomUUID(),
+              expression: calculation.expression,
+              result: calculation.displayResult,
+              createdAt: Date.now(),
+            },
+            ...history,
+          ]);
+        } else if (calculation.status === "undefined") {
+          setCalculationResult("Undefined");
+
+          const position = calculateResultPosition(
+            strokesRef.current,
+            "Undefined"
+          );
+          setResultPosition(position);
+        } else {
+          // "incomplete", "invalid", or "empty"
+          setCalculationResult(null);
+        }
+      })
+      .catch((error) => {
+        console.error("❌ AI recognition failed:", error);
+        if (recognitionRevisionRef.current.isCurrent(revisionId)) {
+          setCalculationResult(null);
+        }
+      });
+  }
+
   function handlePointerUp(event) {
     if (!drawingRef.current) {
       return;
@@ -1057,6 +1140,12 @@ top =
 
     if (tool === "eraser" || tool === "stroke-eraser") {
       flushPendingErasePoints();
+      if (strokesRef.current.length > 0) {
+        processRecognition();
+      } else {
+        recognitionRevisionRef.current.invalidate();
+        setCalculationResult(null);
+      }
     }
 
     if (activeDrawFrameRef.current !== null) {
@@ -1081,164 +1170,22 @@ top =
      */
 
     if (
-  tool === "pen" &&
-  currentStrokeRef.current
-) {
-  const stroke = currentStrokeRef.current;
-
-  stroke.boundingBox =
-    calculateBoundingBox(
-      stroke.points,
-      stroke.width
-    );
-
-  strokesRef.current.push(stroke);
-  commitActiveStroke(stroke);
-  const requestId =
-  ++recognitionRequestRef.current;
-  recognizeStrokes(strokesRef.current)
-  .then((result) => {
-
-    // Ignore an older recognition result
-    if (
-      requestId !== recognitionRequestRef.current
+      tool === "pen" &&
+      currentStrokeRef.current
     ) {
-      console.log(
-        "⏭️ Ignoring stale recognition result"
-      );
+      const stroke = currentStrokeRef.current;
 
-      return;
+      stroke.boundingBox =
+        calculateBoundingBox(
+          stroke.points,
+          stroke.width
+        );
+
+      strokesRef.current.push(stroke);
+      commitActiveStroke(stroke);
+      currentStrokeRef.current = null;
+      processRecognition();
     }
-
-    console.log(
-      "🤖 AI recognition result:",
-      result
-    );
-
-    if (!result || !result.latex) {
-      return;
-    }
-
-    // Convert model output into calculator symbols
-    let expression = result.latex
-  // Convert LaTeX operators
-  .replace(/\\times/g, "×")
-  .replace(/\\div/g, "÷")
-  .replace(/\\cdot/g, "×")
-  .replace(/\\minus/g, "-")
-  .replace(/\\equals/g, "=")
-
-  // Normalize Unicode variants
-  .replace(/[−–—]/g, "-")
-
-  // Remove LaTeX formatting characters
-  .replace(/[{}$]/g, "")
-
-  // Normalize spaces
-  .replace(/\s+/g, "")
-  .trim();
-
-console.log(
-  "🧠 Raw AI expression:",
-  JSON.stringify(expression)
-);
-  // CalcInk allowed vocabulary:
-// digits, decimal point, +, -, ×, ÷ and =
-const allowedCharacterPattern =
-  /^[0-9+\-×÷.=() ]+$/;
-
-if (!allowedCharacterPattern.test(expression)) {
-  console.warn(
-    "⚠️ Unsupported symbol detected:",
-    expression
-  );
-
-  // Do not calculate an expression containing
-  // a symbol outside CalcInk's vocabulary.
-  setCalculationResult(null);
-
-  return;
-}
-    console.log(
-      "🧮 Recognized expression:",
-      JSON.stringify(expression)
-    );
-
-    // Find "="
-    const equalsIndex =
-      expression.lastIndexOf("=");
-
-    // No "=" yet → do not calculate
-    if (equalsIndex === -1) {
-      console.log(
-        "⏳ No '=' detected yet. Waiting..."
-      );
-
-      setCalculationResult(null);
-
-      return;
-    }
-
-    // Everything BEFORE "=" is the mathematical expression
-    const expressionToEvaluate =
-    expression.split("=")[0].trim();
-    console.log(
-      "🧮 Expression to evaluate:",
-      JSON.stringify(expressionToEvaluate)
-    );
-
-    if (!expressionToEvaluate) {
-      setCalculationResult(null);
-      return;
-    }
-
-    const calculation =
-      evaluateExpression(
-        expressionToEvaluate
-      );
-
-    console.log(
-      "🧮 Calculation result:",
-      calculation
-    );
-
-    if (calculation.success) {
-  setCalculationResult(
-    calculation.result
-  );
-
-  setCalculationHistory((history) => [
-    {
-      id: crypto.randomUUID(),
-      expression: expressionToEvaluate,
-      result: calculation.result,
-      createdAt: Date.now(),
-    },
-    ...history,
-  ]);
-
-  const position =
-    calculateResultPosition(
-      strokesRef.current,
-      calculation.result
-    );
-
-  setResultPosition(position);
-
-    } else {
-      setCalculationResult(
-        calculation.error
-      );
-    }
-  })
-  .catch((error) => {
-    console.error(
-      "❌ AI recognition failed:",
-      error
-    );
-  });
-  currentStrokeRef.current = null;
-}
 
     drawingRef.current = false;
   }
@@ -1250,20 +1197,22 @@ if (!allowedCharacterPattern.test(expression)) {
    */
 
   function clearCanvas() {
-  if (strokesRef.current.length === 0) {
+    if (strokesRef.current.length === 0) {
+      recognitionRevisionRef.current.invalidate();
+      setCalculationResult(null);
+      return;
+    }
+
+    saveHistory();
+
+    strokesRef.current = [];
+
+    // Clear the displayed calculation result and invalidate revisions
+    recognitionRevisionRef.current.invalidate();
     setCalculationResult(null);
-    return;
+
+    redrawCanvas();
   }
-
-  saveHistory();
-
-  strokesRef.current = [];
-
-  // Clear the displayed calculation result
-  setCalculationResult(null);
-
-  redrawCanvas();
-}
 
   /*
    * ----------------------------------------------------
