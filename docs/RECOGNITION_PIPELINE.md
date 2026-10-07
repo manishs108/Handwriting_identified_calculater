@@ -36,6 +36,8 @@ UI Answer Projection Beside "="
 
 * **Model Family**: CoMER (Convolutional attention Model for Handwritten Mathematical Expression Recognition).
 * **Integration Layer**: `ink-on` (`ink-on/core`) lightweight browser runtime.
+  * The installed `ink-on` package is version `0.1.0`, identifies its repository as
+    `kimseungdae/ink-on`, and declares the Apache-2.0 license in its package metadata.
 * **Inference Runtime**: ONNX Runtime Web (`onnxruntime-web`) via WebAssembly (`wasm`).
 * **Model Assets**:
   * Encoder: `/models/comer/encoder_int8.onnx` (~3.5 MB, INT8 quantized)
@@ -43,6 +45,15 @@ UI Answer Projection Beside "="
   * Vocabulary: `/models/comer/vocab.json` (~3.7 KB, 238 mathematical tokens)
 * **Execution Strategy**: Single initialization; sessions are cached in memory and reused across all recognition queries.
 * **Beam Search**: Evaluates top token paths with `beamWidth: 3`.
+
+### Bundled model provenance
+
+The repository contains the encoder, decoder, and vocabulary assets listed above, but
+does not include a source URL, training-data record, or license notice for those copied
+ONNX artifacts. Consequently, CalcInk documents only the verified runtime attribution
+above and does not assert an unverified model license. Before a public deployment, the
+team must obtain and retain the asset source and license notice for these exact model
+files.
 
 ---
 

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import "./App.css";
 import {
+  disposeRecognition,
   initializeRecognition,
   recognizeStrokes,
 } from "./recognition/recognition";
@@ -64,18 +65,27 @@ function IconButton({ label, icon, onClick, active = false, danger = false }) {
 }
 
 function App() {
+  const recognitionRevisionRef = useRef(createRevisionController());
+
   useEffect(() => {
-  initializeRecognition()
-    .then(() => {
-      console.log("✅ CalcInk AI model is ready");
-    })
-    .catch((error) => {
-      console.error(
-        "❌ Failed to load CalcInk AI model:",
-        error
-      );
-    });
-}, []);
+    const revisionController = recognitionRevisionRef.current;
+
+    initializeRecognition()
+      .then(() => {
+        console.log("✅ CalcInk AI model is ready");
+      })
+      .catch((error) => {
+        console.error(
+          "❌ Failed to load CalcInk AI model:",
+          error
+        );
+      });
+
+    return () => {
+      revisionController.invalidate();
+      disposeRecognition();
+    };
+  }, []);
   const canvasRef = useRef(null);
   const activeCanvasRef = useRef(null);
   const paperRef = useRef(null);
@@ -96,7 +106,6 @@ function App() {
   const redoStackRef = useRef([]);
 
   const drawingRef = useRef(false);
-  const recognitionRevisionRef = useRef(createRevisionController());
 
   const [brushSize, setBrushSize] = useState(4);
   const [zoom, setZoom] = useState(() => {
