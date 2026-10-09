@@ -5,6 +5,8 @@ import {
   recognizeStrokes,
 } from "./recognition/recognition";
 import { evaluateExpression } from "./math/evaluator";
+import { normalizeRecognizedExpression } from "./math/recognitionExpression";
+import { findHandwrittenEquals } from "./math/equalsDetection";
 
 function ToolbarIcon({ name }) {
   const paths = {
@@ -80,8 +82,10 @@ function App() {
   const paperRef = useRef(null);
   const cursorPreviewRef = useRef(null);
   const activeDrawFrameRef = useRef(null);
+  const activeDrawPointIndexRef = useRef(-1);
   const eraseFrameRef = useRef(null);
   const pendingErasePointsRef = useRef([]);
+  const lastErasePointRef = useRef(null);
   const longPressTimerRef = useRef(null);
 
   // All completed handwriting strokes
@@ -96,6 +100,9 @@ function App() {
 
   const drawingRef = useRef(false);
   const recognitionRequestRef = useRef(0);
+  const recognitionTimerRef = useRef(null);
+  const recognitionInFlightRef = useRef(false);
+  const recognitionPendingRef = useRef(false);
 
   const [brushSize, setBrushSize] = useState(4);
   const [zoom, setZoom] = useState(() => {
@@ -186,7 +193,7 @@ function App() {
 
     if (!canvas || !activeCanvas) return;
 
-    const dpr = window.devicePixelRatio || 1;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
 
     canvas.width = Math.round(canvas.clientWidth * dpr);
     canvas.height = Math.round(canvas.clientHeight * dpr);
@@ -210,14 +217,23 @@ function App() {
     }
 
     redrawCanvas();
-    if (currentStrokeRef.current) scheduleActiveStrokeRedraw();
+    if (currentStrokeRef.current) {
+      activeDrawPointIndexRef.current = -1;
+      scheduleActiveStrokeRedraw();
+    }
   }
 
   /*
    * ----------------------------------------------------
-   * DRAW ONE STROKE
-   * ----------------------------------------------------
-   */
+  * DRAW ONE STROKE
+  * ----------------------------------------------------
+  */
+
+  function pressureAdjustedWidth(baseWidth, pressure = 0.5) {
+    const normalizedPressure = Math.max(0, Math.min(1, pressure));
+    const extraPressure = Math.max(0, normalizedPressure - 0.5);
+    return baseWidth * (1 + extraPressure * 0.9);
+  }
 
   function drawStroke(ctx, stroke) {
     if (!stroke || stroke.points.length === 0) {
@@ -225,49 +241,35 @@ function App() {
     }
 
     const points = stroke.points;
-
-    ctx.beginPath();
-
-    ctx.lineWidth = stroke.width;
-    ctx.lineCap = "round";
-    ctx.lineJoin = "round";
-
-    ctx.strokeStyle = stroke.color || penColor;
-
-    ctx.globalAlpha =
-      stroke.opacity ?? 1;
-
-    ctx.moveTo(points[0].x, points[0].y);
-
     if (points.length === 1) {
-      ctx.lineTo(
-        points[0].x + 0.01,
-        points[0].y + 0.01
-      );
-    } else {
-      for (let i = 1; i < points.length; i++) {
-        const previous = points[i - 1];
-        const current = points[i];
-
-        const midX =
-          (previous.x + current.x) / 2;
-
-        const midY =
-          (previous.y + current.y) / 2;
-
-        ctx.quadraticCurveTo(
-          previous.x,
-          previous.y,
-          midX,
-          midY
-        );
-      }
-
-      const last = points[points.length - 1];
-
-      ctx.lineTo(last.x, last.y);
+      drawStrokeSegment(ctx, stroke, points[0], points[0]);
+      return;
     }
 
+    for (let index = 1; index < points.length; index += 1) {
+      drawStrokeSegment(ctx, stroke, points[index - 1], points[index]);
+    }
+  }
+
+  function drawStrokeSegment(ctx, stroke, start, end) {
+    const pressure = stroke.pressureSensitive
+      ? Math.max(start.pressure ?? 0.5, end.pressure ?? 0.5)
+      : 0.5;
+    const midX = (start.x + end.x) / 2;
+    const midY = (start.y + end.y) / 2;
+
+    ctx.beginPath();
+    ctx.lineWidth = pressureAdjustedWidth(stroke.width, pressure);
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.strokeStyle = stroke.color || penColor;
+    ctx.globalAlpha = stroke.opacity ?? 1;
+    ctx.moveTo(start.x, start.y);
+    ctx.quadraticCurveTo(start.x, start.y, midX, midY);
+    ctx.lineTo(
+      start.x === end.x && start.y === end.y ? start.x + 0.01 : end.x,
+      start.x === end.x && start.y === end.y ? start.y + 0.01 : end.y
+    );
     ctx.stroke();
     ctx.globalAlpha = 1;
   }
@@ -287,7 +289,7 @@ function App() {
 
     if (!ctx) return;
 
-    const dpr = window.devicePixelRatio || 1;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
 
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
@@ -310,7 +312,7 @@ function App() {
     const canvas = activeCanvasRef.current;
     const ctx = canvas?.getContext("2d");
     if (!canvas || !ctx) return;
-    const dpr = window.devicePixelRatio || 1;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight);
   }
@@ -319,36 +321,36 @@ function App() {
     if (activeDrawFrameRef.current !== null) return;
     activeDrawFrameRef.current = requestAnimationFrame(() => {
       activeDrawFrameRef.current = null;
-      clearActiveStrokeCanvas();
       const canvas = activeCanvasRef.current;
       const ctx = canvas?.getContext("2d");
-      if (ctx && currentStrokeRef.current) {
-        drawStroke(ctx, currentStrokeRef.current);
+      const stroke = currentStrokeRef.current;
+      if (!ctx || !stroke || stroke.points.length === 0) return;
+
+      let startIndex = activeDrawPointIndexRef.current;
+      if (startIndex < 0) {
+        drawStrokeSegment(ctx, stroke, stroke.points[0], stroke.points[0]);
+        startIndex = 0;
       }
+      for (let index = startIndex + 1; index < stroke.points.length; index += 1) {
+        drawStrokeSegment(ctx, stroke, stroke.points[index - 1], stroke.points[index]);
+      }
+      activeDrawPointIndexRef.current = stroke.points.length - 1;
     });
   }
 
   function commitActiveStroke(stroke) {
-    const baseCanvas = canvasRef.current;
-    const activeCanvas = activeCanvasRef.current;
-    const baseCtx = baseCanvas?.getContext("2d");
-    const activeCtx = activeCanvas?.getContext("2d");
-    if (!baseCanvas || !activeCanvas || !baseCtx || !activeCtx) return;
-
+    if (activeDrawFrameRef.current !== null) {
+      cancelAnimationFrame(activeDrawFrameRef.current);
+      activeDrawFrameRef.current = null;
+    }
+    const canvas = canvasRef.current;
+    const ctx = canvas?.getContext("2d");
+    if (!canvas || !ctx) return;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    drawStroke(ctx, stroke);
     clearActiveStrokeCanvas();
-    const dpr = window.devicePixelRatio || 1;
-    activeCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    drawStroke(activeCtx, stroke);
-
-    baseCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    baseCtx.drawImage(
-      activeCanvas,
-      0,
-      0,
-      baseCanvas.clientWidth,
-      baseCanvas.clientHeight
-    );
-    clearActiveStrokeCanvas();
+    activeDrawPointIndexRef.current = -1;
   }
 
   function updateCursorPreview(event) {
@@ -379,12 +381,13 @@ function App() {
     const nextSize = Math.min(12, brushSize + 2);
     if (nextSize === brushSize) return;
 
-    setBrushSize(nextSize);
     const stroke = currentStrokeRef.current;
     if (!stroke) return;
 
     stroke.width = getPenWidth(nextSize, penStyle);
     stroke.boundingBox = calculateBoundingBox(stroke.points, stroke.width);
+    clearActiveStrokeCanvas();
+    activeDrawPointIndexRef.current = -1;
     scheduleActiveStrokeRedraw();
   }
 
@@ -403,10 +406,10 @@ function App() {
     return {
       x: (event.clientX - rect.left) / zoom,
       y: (event.clientY - rect.top) / zoom,
-      pressure:
-        event.pressure && event.pressure > 0
-          ? event.pressure
-          : 0.5,
+      // Pressure only changes stylus strokes; mouse and touch retain the base width.
+      pressure: event.pointerType === "pen" && Number.isFinite(event.pressure)
+        ? event.pressure
+        : 0.5,
     };
   }
 
@@ -435,7 +438,11 @@ function App() {
   }
 
   // Include the visible thickness of the pen.
-  const padding = strokeWidth / 2;
+  const maxWidth = points.reduce(
+    (width, point) => Math.max(width, pressureAdjustedWidth(strokeWidth, point.pressure)),
+    strokeWidth
+  );
+  const padding = maxWidth / 2;
 
   minX -= padding;
   minY -= padding;
@@ -458,8 +465,7 @@ function App() {
    */
 
   function saveHistory() {
-    const snapshot =
-      structuredClone(strokesRef.current);
+    const snapshot = strokesRef.current.slice();
 
     undoStackRef.current.push(snapshot);
 
@@ -475,12 +481,17 @@ function App() {
    */
 
   function undo() {
+    // Clear any displayed or still-pending result as soon as Undo is pressed.
+    setCalculationResult(null);
+    recognitionRequestRef.current += 1;
+    window.clearTimeout(recognitionTimerRef.current);
+    recognitionPendingRef.current = false;
+
     if (undoStackRef.current.length === 0) {
       return;
     }
 
-    const current =
-      structuredClone(strokesRef.current);
+    const current = strokesRef.current.slice();
 
     redoStackRef.current.push(current);
 
@@ -491,6 +502,7 @@ function App() {
       previous || [];
 
     redrawCanvas();
+    scheduleRecognition();
   }
 
   /*
@@ -504,8 +516,10 @@ function App() {
       return;
     }
 
-    const current =
-      structuredClone(strokesRef.current);
+    window.clearTimeout(recognitionTimerRef.current);
+    recognitionPendingRef.current = false;
+
+    const current = strokesRef.current.slice();
 
     undoStackRef.current.push(current);
 
@@ -516,6 +530,8 @@ function App() {
       next || [];
 
     redrawCanvas();
+    setCalculationResult(null);
+    scheduleRecognition();
   }
 
   /*
@@ -530,6 +546,21 @@ function App() {
 
     return Math.sqrt(
       dx * dx + dy * dy
+    );
+  }
+
+  function distanceToSegment(point, start, end) {
+    const dx = end.x - start.x;
+    const dy = end.y - start.y;
+    const lengthSquared = dx * dx + dy * dy;
+    if (lengthSquared === 0) return distance(point, start);
+
+    const projection = Math.max(0, Math.min(1,
+      ((point.x - start.x) * dx + (point.y - start.y) * dy) / lengthSquared
+    ));
+    return Math.hypot(
+      point.x - (start.x + projection * dx),
+      point.y - (start.y + projection * dy)
     );
   }
 
@@ -578,6 +609,10 @@ function App() {
         for (let i = 1; i < points.length; i++) {
           const start = points[i - 1];
           const end = points[i];
+          if (distanceToSegment(point, start, end) > radius + 2) {
+            fragment.push(end);
+            continue;
+          }
           const steps = Math.max(1, Math.ceil(distance(start, end) / 3));
           for (let step = i === 1 ? 0 : 1; step <= steps; step++) {
             const t = step / steps;
@@ -629,24 +664,12 @@ function App() {
         point.y < bounds.minY - radius ||
         point.y > bounds.maxY + radius
       )) return true;
-      let hit = points.some((strokePoint) => distance(strokePoint, point) <= radius);
-      for (let i = 1; !hit && i < points.length; i++) {
-        const start = points[i - 1];
-        const end = points[i];
-        const steps = Math.max(1, Math.ceil(distance(start, end) / 3));
-        for (let step = 1; step < steps; step++) {
-          const sample = {
-            x: start.x + (end.x - start.x) * step / steps,
-            y: start.y + (end.y - start.y) * step / steps,
-          };
-          if (distance(sample, point) <= radius) {
-            hit = true;
-            break;
-          }
-        }
-      }
-      if (hit) changed = true;
-      return !hit;
+      const hit = points.some((strokePoint) => distance(strokePoint, point) <= radius);
+      const segmentHit = !hit && points.some((strokePoint, index) =>
+        index > 0 && distanceToSegment(point, points[index - 1], strokePoint) <= radius
+      );
+      if (hit || segmentHit) changed = true;
+      return !(hit || segmentHit);
     });
 
     if (changed) {
@@ -672,6 +695,9 @@ function App() {
   }
 
   function scheduleErasePoint(point) {
+    const previousPoint = lastErasePointRef.current;
+    if (previousPoint && distance(previousPoint, point) < 1 / zoom) return;
+    lastErasePointRef.current = point;
     pendingErasePointsRef.current.push(point);
     if (eraseFrameRef.current !== null) return;
     eraseFrameRef.current = requestAnimationFrame(flushPendingErasePoints);
@@ -707,11 +733,17 @@ function App() {
      */
 
     if (tool === "eraser" || tool === "stroke-eraser") {
+      setCalculationResult(null);
+      recognitionRequestRef.current += 1;
+      window.clearTimeout(recognitionTimerRef.current);
+      recognitionPendingRef.current = false;
       saveHistory();
 
-      if (tool === "stroke-eraser") eraseStrokeAtPoint(point);
-      else eraseAtPoint(point);
-
+      pendingErasePointsRef.current.push(point);
+      lastErasePointRef.current = point;
+      if (eraseFrameRef.current === null) {
+        eraseFrameRef.current = requestAnimationFrame(flushPendingErasePoints);
+      }
       drawingRef.current = true;
 
       return;
@@ -729,6 +761,10 @@ function App() {
      * PEN MODE
      */
 
+    setCalculationResult(null);
+    recognitionRequestRef.current += 1;
+    window.clearTimeout(recognitionTimerRef.current);
+    recognitionPendingRef.current = false;
     saveHistory();
 
     drawingRef.current = true;
@@ -743,6 +779,8 @@ function App() {
 
 currentStrokeRef.current = {
   id: crypto.randomUUID(),
+
+  pressureSensitive: event.pointerType === "pen",
 
   points: [point],
 
@@ -760,6 +798,7 @@ currentStrokeRef.current = {
   createdAt: Date.now(),
 };
 
+    activeDrawPointIndexRef.current = -1;
     scheduleActiveStrokeRedraw();
   }
 
@@ -795,20 +834,26 @@ currentStrokeRef.current = {
       return;
     }
 
-    currentStrokeRef.current.points.push(
-  point
-);
+    const points = currentStrokeRef.current.points;
+    const lastPoint = points[points.length - 1];
+    const minMovement = 0.6 / zoom;
+    const dx = point.x - lastPoint.x;
+    const dy = point.y - lastPoint.y;
+    const pressureChanged = currentStrokeRef.current.pressureSensitive
+      && Math.abs((point.pressure ?? 0.5) - (lastPoint.pressure ?? 0.5)) >= 0.08;
+    if (dx * dx + dy * dy < minMovement * minMovement && !pressureChanged) return;
 
-const box = currentStrokeRef.current.boundingBox;
-const padding = currentStrokeRef.current.width / 2;
-box.minX = Math.min(box.minX, point.x - padding);
-box.minY = Math.min(box.minY, point.y - padding);
-box.maxX = Math.max(box.maxX, point.x + padding);
-box.maxY = Math.max(box.maxY, point.y + padding);
-box.width = box.maxX - box.minX;
-box.height = box.maxY - box.minY;
+    points.push(point);
+    const box = currentStrokeRef.current.boundingBox;
+    const padding = pressureAdjustedWidth(currentStrokeRef.current.width, point.pressure) / 2;
+    box.minX = Math.min(box.minX, point.x - padding);
+    box.minY = Math.min(box.minY, point.y - padding);
+    box.maxX = Math.max(box.maxX, point.x + padding);
+    box.maxY = Math.max(box.maxY, point.y + padding);
+    box.width = box.maxX - box.minX;
+    box.height = box.maxY - box.minY;
 
-scheduleActiveStrokeRedraw();
+    scheduleActiveStrokeRedraw();
   }
 
   /*
@@ -833,7 +878,7 @@ scheduleActiveStrokeRedraw();
    * ----------------------------------------------------
    */
 
-  const equalsStrokes = strokes.slice(-2);
+  const equalsStrokes = findHandwrittenEquals(strokes) || strokes.slice(-1);
 
   const equalsPoints = equalsStrokes.flatMap(
     (stroke) => stroke.points
@@ -971,30 +1016,8 @@ const answerLeft =
    * ----------------------------------------------------
    */
 
-  const finalEstimatedWidth =
-    resultText.length *
-    fontSize *
-    0.58;
-
-  let finalLeft = answerLeft;
-
-  /*
-   * If something still exceeds the canvas,
-   * move it slightly left.
-   */
-
-  if (
-    finalLeft + finalEstimatedWidth >
-    canvas.clientWidth - rightPadding
-  ) {
-    finalLeft =
-      Math.max(
-        10,
-        canvas.clientWidth -
-          rightPadding -
-          finalEstimatedWidth
-      );
-  }
+  // Keep the answer to the right of '=', even when the expression fills the page.
+  const finalLeft = answerLeft;
 
 
   /*
@@ -1048,6 +1071,98 @@ top =
     fontSize,
   };
 }
+
+  function recognizeAndCalculate() {
+    if (recognitionInFlightRef.current) {
+      recognitionPendingRef.current = true;
+      return;
+    }
+
+    const strokeSnapshot = strokesRef.current.slice();
+    if (strokeSnapshot.length === 0) {
+      setCalculationResult(null);
+      return;
+    }
+    const requestId = ++recognitionRequestRef.current;
+    recognitionInFlightRef.current = true;
+    recognizeStrokes(strokeSnapshot)
+      .then((result) => {
+        if (requestId !== recognitionRequestRef.current) return;
+        if (!result?.latex) {
+          setCalculationResult(null);
+          return;
+        }
+
+        const expression = normalizeRecognizedExpression(result.latex);
+
+        console.info("CalcInk recognition:", {
+          recognizedLatex: result.latex,
+          normalizedExpression: expression,
+        });
+
+        const allowedCharacterPattern = /^[0-9+*/.=() -]+$/;
+        if (!allowedCharacterPattern.test(expression)) {
+          setCalculationResult(null);
+          return;
+        }
+
+        const equalsIndex = expression.indexOf("=");
+        if (
+          equalsIndex < 1
+          || !findHandwrittenEquals(strokeSnapshot)
+        ) {
+          setCalculationResult(null);
+          return;
+        }
+        const expressionToEvaluate = expression.slice(0, equalsIndex).trim();
+        if (!expressionToEvaluate) {
+          setCalculationResult(null);
+          return;
+        }
+
+        const calculation = evaluateExpression(expressionToEvaluate);
+        const displayedResult = calculation.success
+          ? calculation.result
+          : calculation.error;
+
+        // Position errors (including division by zero) beside the expression too.
+        setResultPosition(calculateResultPosition(strokeSnapshot, displayedResult));
+        if (!calculation.success) {
+          setCalculationResult(displayedResult);
+          return;
+        }
+
+        setCalculationResult(calculation.result);
+        setCalculationHistory((history) => [
+          {
+            id: crypto.randomUUID(),
+            expression: expressionToEvaluate,
+            result: calculation.result,
+            createdAt: Date.now(),
+          },
+          ...history,
+        ]);
+      })
+      .catch((error) => {
+        console.error("Recognition failed:", error);
+      })
+      .finally(() => {
+        recognitionInFlightRef.current = false;
+        if (recognitionPendingRef.current) {
+          recognitionPendingRef.current = false;
+          scheduleRecognition(0);
+        }
+      });
+  }
+
+  function scheduleRecognition(delay = 400) {
+    window.clearTimeout(recognitionTimerRef.current);
+    const requestId = ++recognitionRequestRef.current;
+    recognitionTimerRef.current = window.setTimeout(() => {
+      if (requestId === recognitionRequestRef.current) recognizeAndCalculate();
+    }, delay);
+  }
+
   function handlePointerUp(event) {
     if (!drawingRef.current) {
       return;
@@ -1057,6 +1172,9 @@ top =
 
     if (tool === "eraser" || tool === "stroke-eraser") {
       flushPendingErasePoints();
+      if (strokesRef.current.length > 0) scheduleRecognition();
+      else setCalculationResult(null);
+      lastErasePointRef.current = null;
     }
 
     if (activeDrawFrameRef.current !== null) {
@@ -1094,150 +1212,8 @@ top =
 
   strokesRef.current.push(stroke);
   commitActiveStroke(stroke);
-  const requestId =
-  ++recognitionRequestRef.current;
-  recognizeStrokes(strokesRef.current)
-  .then((result) => {
-
-    // Ignore an older recognition result
-    if (
-      requestId !== recognitionRequestRef.current
-    ) {
-      console.log(
-        "⏭️ Ignoring stale recognition result"
-      );
-
-      return;
-    }
-
-    console.log(
-      "🤖 AI recognition result:",
-      result
-    );
-
-    if (!result || !result.latex) {
-      return;
-    }
-
-    // Convert model output into calculator symbols
-    let expression = result.latex
-  // Convert LaTeX operators
-  .replace(/\\times/g, "×")
-  .replace(/\\div/g, "÷")
-  .replace(/\\cdot/g, "×")
-  .replace(/\\minus/g, "-")
-  .replace(/\\equals/g, "=")
-
-  // Normalize Unicode variants
-  .replace(/[−–—]/g, "-")
-
-  // Remove LaTeX formatting characters
-  .replace(/[{}$]/g, "")
-
-  // Normalize spaces
-  .replace(/\s+/g, "")
-  .trim();
-
-console.log(
-  "🧠 Raw AI expression:",
-  JSON.stringify(expression)
-);
-  // CalcInk allowed vocabulary:
-// digits, decimal point, +, -, ×, ÷ and =
-const allowedCharacterPattern =
-  /^[0-9+\-×÷.=() ]+$/;
-
-if (!allowedCharacterPattern.test(expression)) {
-  console.warn(
-    "⚠️ Unsupported symbol detected:",
-    expression
-  );
-
-  // Do not calculate an expression containing
-  // a symbol outside CalcInk's vocabulary.
-  setCalculationResult(null);
-
-  return;
-}
-    console.log(
-      "🧮 Recognized expression:",
-      JSON.stringify(expression)
-    );
-
-    // Find "="
-    const equalsIndex =
-      expression.lastIndexOf("=");
-
-    // No "=" yet → do not calculate
-    if (equalsIndex === -1) {
-      console.log(
-        "⏳ No '=' detected yet. Waiting..."
-      );
-
-      setCalculationResult(null);
-
-      return;
-    }
-
-    // Everything BEFORE "=" is the mathematical expression
-    const expressionToEvaluate =
-    expression.split("=")[0].trim();
-    console.log(
-      "🧮 Expression to evaluate:",
-      JSON.stringify(expressionToEvaluate)
-    );
-
-    if (!expressionToEvaluate) {
-      setCalculationResult(null);
-      return;
-    }
-
-    const calculation =
-      evaluateExpression(
-        expressionToEvaluate
-      );
-
-    console.log(
-      "🧮 Calculation result:",
-      calculation
-    );
-
-    if (calculation.success) {
-  setCalculationResult(
-    calculation.result
-  );
-
-  setCalculationHistory((history) => [
-    {
-      id: crypto.randomUUID(),
-      expression: expressionToEvaluate,
-      result: calculation.result,
-      createdAt: Date.now(),
-    },
-    ...history,
-  ]);
-
-  const position =
-    calculateResultPosition(
-      strokesRef.current,
-      calculation.result
-    );
-
-  setResultPosition(position);
-
-    } else {
-      setCalculationResult(
-        calculation.error
-      );
-    }
-  })
-  .catch((error) => {
-    console.error(
-      "❌ AI recognition failed:",
-      error
-    );
-  });
   currentStrokeRef.current = null;
+  scheduleRecognition();
 }
 
     drawingRef.current = false;
@@ -1250,6 +1226,9 @@ if (!allowedCharacterPattern.test(expression)) {
    */
 
   function clearCanvas() {
+  recognitionRequestRef.current += 1;
+  window.clearTimeout(recognitionTimerRef.current);
+  recognitionPendingRef.current = false;
   if (strokesRef.current.length === 0) {
     setCalculationResult(null);
     return;
@@ -1290,6 +1269,7 @@ if (!allowedCharacterPattern.test(expression)) {
       if (eraseFrameRef.current !== null) {
         cancelAnimationFrame(eraseFrameRef.current);
       }
+      window.clearTimeout(recognitionTimerRef.current);
     };
   }, []);
 
@@ -1671,8 +1651,8 @@ if (!allowedCharacterPattern.test(expression)) {
   <div
     className="calculation-result"
     style={{
-      left: `${20 + resultPosition.left * zoom}px`,
-      top: `${20 + resultPosition.top * zoom}px`,
+      left: `${(canvasRef.current?.offsetLeft ?? 20) + resultPosition.left * zoom}px`,
+      top: `${(canvasRef.current?.offsetTop ?? 20) + resultPosition.top * zoom}px`,
       fontSize: `${resultPosition.fontSize * zoom}px`,
     }}
   >
